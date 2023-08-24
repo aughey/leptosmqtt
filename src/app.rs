@@ -1,26 +1,24 @@
-use std::{cell::RefCell, rc::Rc};
-
-use anyhow::Ok;
-use futures::StreamExt;
 use leptos::*;
 use leptos_meta::*;
 use leptos_router::*;
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::prelude::*;
 
-// Import the `window.alert` function from the Web.
-#[wasm_bindgen] //(module = "/js/mqtt-bind.js")]
+#[wasm_bindgen]
 extern "C" {
-    fn mqtt_connect(
+    #[wasm_bindgen(catch)]
+    async fn mqtt_connect(
         hostname: &str,
         port: u16,
         client_id: &str,
-        onConnect: &Closure<dyn FnMut()>,
-        onFail: &Closure<dyn FnMut()>,
         onDisconnect: &Closure<dyn FnMut()>,
         onMessage: &Closure<dyn FnMut(String, String)>,
-    ) -> u32;
+    ) -> Result<JsValue, JsValue>;
     fn mqtt_close(id: u32);
-    fn mqtt_subscribe(id: u32, topics: &str);
+    #[wasm_bindgen(catch)]
+    async fn mqtt_subscribe(id: u32, topics: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch)]
+    async fn mqtt_unsubscribe(id: u32, topics: &str) -> Result<(), JsValue>;
 }
 
 // Automatically drops the connection when it goes out of scope
@@ -33,24 +31,17 @@ impl Drop for MqttID {
 
 pub struct MqttConnection {
     id: Rc<RefCell<Option<MqttID>>>,
-    msgrx: futures::channel::mpsc::Receiver<(String, String)>,
     _on_disconnect: Closure<dyn FnMut()>,
     _on_message: Closure<dyn FnMut(String, String)>,
 }
 impl MqttConnection {
-    /// Waits for a message to arrive.  Returns the topic and message.
-    pub async fn next(&mut self) -> anyhow::Result<(String, String)> {
-        self.msgrx
-            .next()
-            .await
-            .ok_or(anyhow::anyhow!("Disconnected"))
-    }
-    pub fn subscribe(&mut self, topic: &str) -> anyhow::Result<()> {
+    pub async fn subscribe(&mut self, topic: &str) -> anyhow::Result<()> {
         let id = self.id.borrow();
         let id = id.as_ref().ok_or(anyhow::anyhow!("Disconnected"))?;
 
-        mqtt_subscribe(id.0, topic);
-        Ok(())
+        mqtt_subscribe(id.0, topic)
+            .await
+            .map_err(|_| anyhow::anyhow!("Error in javascript subscribe"))
     }
 }
 
@@ -58,66 +49,41 @@ async fn rs_mqtt_connect(
     hostname: &str,
     port: u16,
     client_id: &str,
+    on_message: impl FnMut(String, String) + 'static,
+    caller_on_disconnect: impl FnMut() + 'static,
 ) -> anyhow::Result<MqttConnection> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    let tx = Rc::new(RefCell::new(Some(tx)));
-    let on_connect = {
-        let tx = tx.clone();
-        Closure::new(move || {
-            log!("got connect callback");
-            tx.borrow_mut().take().unwrap().send(true).unwrap();
-        })
-    };
-    let on_fail = Closure::new(move || {
-        log!("Failed to connect");
-        tx.borrow_mut().take().unwrap().send(false).unwrap();
-    });
-
-    let (msgtx, msgrx) = futures::channel::mpsc::channel(16);
-    let msgtx = Rc::new(RefCell::new(msgtx));
-    let on_message = Closure::new(move |topic: String, message: String| {
-        log!("got message callback");
-        msgtx.borrow_mut().try_send((topic, message)).unwrap();
-        ()
-    });
+    let on_message = Closure::new(on_message);
 
     // The connection id is an optional u32 where the optional state indicates connection
     let connect_id = Rc::new(RefCell::new(None));
+
+    let mut caller_on_disconnect = Some(caller_on_disconnect);
 
     let on_disconnect = {
         let connect_id = connect_id.clone();
         Closure::new(move || {
             _ = connect_id.borrow_mut().take();
+            caller_on_disconnect.take().unwrap()();
             log!("Disconnected");
         })
     };
 
     // Set our connection id
-    *connect_id.borrow_mut() = Some(MqttID(mqtt_connect(
-        hostname,
-        port,
-        client_id,
-        &on_connect,
-        &on_fail,
-        &on_disconnect,
-        &on_message,
-    )));
-    let success = rx.await?;
+    let id = mqtt_connect(hostname, port, client_id, &on_disconnect, &on_message)
+        .await
+        .map_err(|_| anyhow::anyhow!("Failed to connect"))?;
+    let id = id
+        .as_string()
+        .ok_or_else(|| anyhow::anyhow!("Could not get string from id is mqtt_connect"))?
+        .parse::<u32>()?;
 
-    // Explicitly drop so that the callbacks are held in the async closure
-    drop(on_connect);
-    drop(on_fail);
+    *connect_id.borrow_mut() = Some(MqttID(id));
 
-    if success {
-        Ok(MqttConnection {
-            id: connect_id,
-            _on_disconnect: on_disconnect,
-            _on_message: on_message,
-            msgrx,
-        })
-    } else {
-        Err(anyhow::anyhow!("Failed to connect"))
-    }
+    Ok(MqttConnection {
+        id: connect_id,
+        _on_disconnect: on_disconnect,
+        _on_message: on_message,
+    })
 }
 
 #[component]
@@ -138,7 +104,7 @@ pub fn App() -> impl IntoView {
         <Router>
             <main>
                 <Routes>
-                    <Route path="" view=HomePage/>
+                    <Route path="/" view=HomePage/>
                     <Route path="/*any" view=NotFound/>
                 </Routes>
             </main>
@@ -153,20 +119,48 @@ fn HomePage() -> impl IntoView {
     let (count, set_count) = create_signal(0);
     let on_click = move |_| set_count.update(|count| *count += 1);
 
-    create_local_resource(
-        || (),
-        |_| async move {
-            let mut res = rs_mqtt_connect("localhost", 9002, "leptosclient").await?;
-            res.subscribe("test").unwrap();
-            let msg = res.next().await.unwrap();
-            log!("got message: {:?}", msg);
+    let (value, set_value) = create_signal("NONE".to_string());
 
-            Ok(())
+    // let params = use_params_map();
+    // let id = params.with(|params| params.get("id").unwrap().to_owned());
+
+
+    let connection = create_local_resource(
+        || (),
+        move |_| async move {
+            let on_message = move |topic: String, message: String| {
+                set_value(format!("{}: {}", topic, message));
+                //                log!("Got message: {} on topic {}", message, topic);
+            };
+            // let (done_tx, done_rx) = futures::channel::oneshot::channel();
+            // let mut done_tx = Some(done_tx);
+            let on_disconnect = move || {
+                log!("Disconnected");
+                // done_tx.take().map(|tx| tx.send(()));
+            };
+            log!("STarting connect");
+            let mut res =
+                rs_mqtt_connect("localhost", 9002, "leptosclient", on_message, on_disconnect)
+                    .await
+                    .map_err(|e| {
+                        log!("Got error: {:?}", e);
+                        e
+                    })?;
+            res.subscribe("test").await?;
+            log!("finished subscribing");
+
+            // done_rx.await?;
+
+            Ok::<MqttConnection,anyhow::Error>(res)
         },
     );
 
+    let connected_msg = move||connection.with(|_| view! { <h1>"Connected"</h1> });
+
     view! {
         <h1>"Welcome to Leptos!"</h1>
+        {value}
+        {connected_msg}
         <button on:click=on_click>"Click Me: " {count}</button>
     }
 }
